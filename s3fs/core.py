@@ -720,6 +720,7 @@ class S3FileSystem(AsyncFileSystem):
         delimiter="/",
         prefix="",
         versions=False,
+        pagination_config=None,
     ):
         bucket, key, _ = self.split_path(path)
         if not prefix:
@@ -729,7 +730,6 @@ class S3FileSystem(AsyncFileSystem):
         if path not in self.dircache or refresh or not delimiter or versions:
             try:
                 logger.debug("Get directory listing page for %s" % path)
-                dirs = []
                 files = []
                 async for c in self._iterdir(
                     bucket,
@@ -737,12 +737,11 @@ class S3FileSystem(AsyncFileSystem):
                     delimiter=delimiter,
                     prefix=prefix,
                     versions=versions,
+                    pagination_config=pagination_config
                 ):
-                    if c["type"] == "directory":
-                        dirs.append(c)
-                    else:
-                        files.append(c)
-                files += dirs
+                    files.append(c)
+                    if max_items and len(files) >= max_items:
+                        return files[:max_items]
             except ClientError as e:
                 raise translate_boto_error(e)
 
@@ -752,7 +751,7 @@ class S3FileSystem(AsyncFileSystem):
         return self.dircache[path]
 
     async def _iterdir(
-        self, bucket, max_items=None, delimiter="/", prefix="", versions=False
+        self, bucket, max_items=None, delimiter="/", prefix="", versions=False, pagination_config=None,
     ):
         """Iterate asynchronously over files and directories under `prefix`.
 
@@ -774,6 +773,8 @@ class S3FileSystem(AsyncFileSystem):
         config = {}
         if max_items is not None:
             config.update(MaxItems=max_items, PageSize=2 * max_items)
+        if pagination_config and pagination_config.get("starttoken"):
+            config["starttoken"] = pagination_config["starttoken"]
         it = pag.paginate(
             Bucket=bucket,
             Prefix=prefix,
@@ -782,6 +783,8 @@ class S3FileSystem(AsyncFileSystem):
             **self.req_kw,
         )
         async for i in it:
+            startingtoken = i.get("starttoken")
+            pagination_config["starttoken"] = startingtoken
             for l in i.get("CommonPrefixes", []):
                 c = {
                     "Key": l["Prefix"][:-1],
@@ -790,6 +793,7 @@ class S3FileSystem(AsyncFileSystem):
                     "type": "directory",
                 }
                 self._fill_info(c, bucket, versions=False)
+
                 yield c
             for c in i.get(contents_key, []):
                 if not self.version_aware or c.get("IsLatest") or versions:
@@ -997,7 +1001,7 @@ class S3FileSystem(AsyncFileSystem):
             return files
         return self.dircache[""]
 
-    async def _ls(self, path, detail=False, refresh=False, versions=False):
+    async def _ls(self, path, detail=False, refresh=False, versions=False, pagination_config=None):
         """List files in given bucket, or list of buckets.
 
         Listing is cached unless `refresh=True`.
@@ -1012,15 +1016,16 @@ class S3FileSystem(AsyncFileSystem):
         refresh : bool (=False)
             if False, look in local cache for file details first
         """
+        pagination_config = pagination_config or {}
         path = self._strip_protocol(path).rstrip("/")
         if path in ["", "/"]:
             files = await self._lsbuckets(refresh)
         else:
-            files = await self._lsdir(path, refresh, versions=versions)
+            files = await self._lsdir(path, refresh, versions=versions, max_items=pagination_config.get("max_items"), pagination_config=pagination_config)
             if not files and "/" in path:
                 try:
                     files = await self._lsdir(
-                        self._parent(path), refresh=refresh, versions=versions
+                        self._parent(path), refresh=refresh, versions=versions, max_items=pagination_config.get("max_items"), pagination_config=pagination_config
                     )
                 except IOError:
                     pass
